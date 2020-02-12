@@ -118,19 +118,35 @@ class BetterBookmarksCommand(sublime_plugin.TextCommand):
       if subcommand == 'mark_line':
          mode = Settings().get('marking_mode', 'selection')
 
-         if mode == 'line':
+         # single mark per line (BAD: highlights text on cycle)
+         if mode == 'line':  
+            # [Region] "a list of lines intersecting selection"
+            # eg [(4993, 5021)]
             selection = view.lines(view.sel()[0])
-         elif mode == 'selection':
+         # multiple marks per line (good: no highlighted text on cycle)
+         elif mode == 'selection':  # 
+            # Selection: "a reference to the selection"
+            # eg <sublime.Selection object at 0x109b2ad90>
             selection = view.sel()
          else:
             sublime.error_message('Invalid BetterBookmarks setting: \'{}\' is invalid for \'marking_mode\''.format(mode))
 
-         line = args['line'] if 'line' in args else selection
+         # if 'line' in args:  # I've never seen this case; what is this?
+            # line = args['line']
+         # else:
+         line = selection
          layer = args['layer'] if 'layer' in args else self.layer
 
          self._add_marks(line, layer)
       elif subcommand == 'cycle_mark':
          self.view.run_command('{}_bookmark'.format(args['direction']), {'name': 'better_bookmarks'})
+         
+         # go to start of line to un-highlight/select text resulting 
+         # from a Region mark in line mode
+         mode = Settings().get('marking_mode', 'selection')
+         if mode == 'line':  
+            self.view.run_command("move_to", {"to": "bol"})
+
       elif subcommand == 'clear_marks':
          layer = args['layer'] if 'layer' in args else self.layer
          self.view.erase_regions('better_bookmarks')
