@@ -6,6 +6,9 @@ def plugin_loaded():
    if not os.path.exists(directory):
       os.makedirs(directory)
 
+# Views whose marks were read from the cache during this plugin session.
+Loaded = set()
+
 def Log(message):
    if Settings().get('verbose', False):
       print('[BetterBookmarks] ' + message)
@@ -23,6 +26,35 @@ def FixRegion(mark):
    if Settings().get("ignore_cursor", True):
       return [mark.begin(), mark.end()]
    return [mark.a, mark.b]
+
+# Offsets go stale when the file is edited elsewhere (another machine, git, a
+#  formatter), so each end of a mark is also stored as its line number, column,
+#  and line text. The offsets stay first so older versions can still read marks.
+def ToMark(view, mark):
+   a, b = FixRegion(mark)
+   return [a, b, ToAnchor(view, a), ToAnchor(view, b)]
+
+def ToAnchor(view, point):
+   row, col = view.rowcol(point)
+   return {'line': row, 'col': col, 'text': view.substr(view.line(point))}
+
+# Find the anchor's line: its old number if the text still matches there,
+#  otherwise the nearest line with identical text, otherwise the old number.
+def FromMark(view, lines, mark):
+   if len(mark) < 4:
+      return sublime.Region(min(mark[0], view.size()), min(mark[1], view.size()))
+   return sublime.Region(FromAnchor(view, lines, mark[2]), FromAnchor(view, lines, mark[3]))
+
+def FromAnchor(view, lines, anchor):
+   row, text = anchor['line'], anchor['text']
+   if not (row < len(lines) and lines[row] == text):
+      matches = [i for i, line in enumerate(lines) if line == text]
+      if matches:
+         row = min(matches, key=lambda i: abs(i - row))
+      else:
+         row = min(row, len(lines) - 1)
+   col = min(anchor['col'], len(lines[row]))
+   return view.text_point(row, col)
 
 class BetterBookmarksCommand(sublime_plugin.TextCommand):
    def __init__(self, edit):
@@ -76,7 +108,7 @@ class BetterBookmarksCommand(sublime_plugin.TextCommand):
          else:
             marks.append(mark)
 
-      self.view.add_regions(region, marks, '', '', 0)
+      self.view.add_regions(region, marks, '', '', sublime.PERSISTENT)
 
       if layer == self.layer:
          self._render()
@@ -102,14 +134,38 @@ class BetterBookmarksCommand(sublime_plugin.TextCommand):
 
       self._render()
 
+   # An empty view only overwrites the cache once this view has loaded it, so a
+   #  view whose marks were never restored can't wipe the synced cache.
    def _save_marks(self):
-      if not self._is_empty():
-         Log('Saving BBFile for ' + self.filename)
-         with open(self._get_cache_filename(), 'w') as fp:
-            marks = {'filename': self.view.file_name(), 'bookmarks': {}}
-            for layer in self.layers:
-               marks['bookmarks'][layer] = [FixRegion(mark) for mark in self.view.get_regions(self._get_region_name(layer))]
-            json.dump(marks, fp)
+      if not self.view.file_name():
+         return
+      if self._is_empty() and self.view.id() not in Loaded:
+         return
+      Log('Saving BBFile for ' + self.filename)
+      marks = {'filename': self.view.file_name(), 'bookmarks': {}}
+      for layer in self.layers:
+         marks['bookmarks'][layer] = [ToMark(self.view, mark) for mark in self.view.get_regions(self._get_region_name(layer))]
+      with open(self._get_cache_filename(), 'w') as fp:
+         json.dump(marks, fp)
+
+   # Write as soon as marks change, so syncs and reloads see current marks.
+   def _save_marks_now(self):
+      if Settings().get('cache_marks_on_save'):
+         self._save_marks()
+
+   def _load_marks(self):
+      Log('Loading BBFile for ' + self.filename)
+      for layer in self.layers:
+         self.view.erase_regions(self._get_region_name(layer))
+      try:
+         with open(self._get_cache_filename(), 'r') as fp:
+            data = json.load(fp)
+      except (OSError, ValueError):
+         data = {'bookmarks': {}}
+      lines = self.view.substr(sublime.Region(0, self.view.size())).split('\n')
+      for name, marks in data['bookmarks'].items():
+         self._add_marks([FromMark(self.view, lines, mark) for mark in marks], name)
+      Loaded.add(self.view.id())
 
    def run(self, edit, **args):
       view = self.view
@@ -129,16 +185,19 @@ class BetterBookmarksCommand(sublime_plugin.TextCommand):
          layer = args['layer'] if 'layer' in args else self.layer
 
          self._add_marks(line, layer)
+         self._save_marks_now()
       elif subcommand == 'cycle_mark':
          self.view.run_command('{}_bookmark'.format(args['direction']), {'name': 'better_bookmarks'})
       elif subcommand == 'clear_marks':
          layer = args['layer'] if 'layer' in args else self.layer
          self.view.erase_regions('better_bookmarks')
          self.view.erase_regions(self._get_region_name(layer))
+         self._save_marks_now()
       elif subcommand == 'clear_all':
          self.view.erase_regions('better_bookmarks')
          for layer in self.layers:
             self.view.erase_regions(self._get_region_name(layer))
+         self._save_marks_now()
       elif subcommand == 'layer_swap':
          direction = args.get('direction')
          if direction == 'prev':
@@ -150,27 +209,21 @@ class BetterBookmarksCommand(sublime_plugin.TextCommand):
 
          self._change_to_layer(self.layers[0])
       elif subcommand == 'on_load':
-         Log('Loading BBFile for ' + self.filename)
-         try:
-            with open(self._get_cache_filename(), 'r') as fp:
-               data = json.load(fp)
-
-               for name, marks in data['bookmarks'].items():
-                  self._add_marks([sublime.Region(mark[0], mark[1]) for mark in marks], name)
-         except Exception as e:
-            pass
+         self._load_marks()
          self._change_to_layer(Settings().get('default_layer'))
       elif subcommand == 'on_save':
          self._save_marks()
       elif subcommand == 'on_close':
          if Settings().get('cache_marks_on_close', False):
             self._save_marks()
-         if Settings().get('cleanup_empty_cache_on_close', False) and self._is_empty():
+         # Only a view that loaded its marks can know the cache should be empty.
+         if Settings().get('cleanup_empty_cache_on_close', False) and self._is_empty() and self.view.id() in Loaded:
             Log('Removing BBFile for ' + self.filename)
             try:
                os.remove(self._get_cache_filename())
-            except FileNotFoundError as e:
+            except OSError:
                pass
+         Loaded.discard(self.view.id())
 
 class BetterBookmarksEventListener(sublime_plugin.EventListener):
    def __init__(self):
@@ -181,6 +234,17 @@ class BetterBookmarksEventListener(sublime_plugin.EventListener):
 
    def on_load_async(self, view):
       if Settings().get('uncache_marks_on_load'):
+         self._contact(view, 'on_load')
+
+   # The file changed on disk, so re-anchor from the cache, which is only
+   #  current if marks are written as they change.
+   def on_reload_async(self, view):
+      if view.file_name() and Settings().get('uncache_marks_on_load') and Settings().get('cache_marks_on_save'):
+         self._contact(view, 'on_load')
+
+   # Views restored from a session may never get on_load.
+   def on_activated_async(self, view):
+      if view.file_name() and not view.is_loading() and view.id() not in Loaded and Settings().get('uncache_marks_on_load'):
          self._contact(view, 'on_load')
 
    def on_pre_save(self, view):
